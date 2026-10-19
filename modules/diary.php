@@ -1,204 +1,244 @@
 <?php
-require_once __DIR__ . '/../includes/layout.php';
-$pdo = db();
+/**
+ * Project Planner Diary — PP-SDOMS
+ * Native PHP 8.1+ & MySQL (No Node.js)
+ *
+ * CHANGES APPLIED (per request):
+ *   2(a) A meeting/diary entry can be attached to MORE THAN ONE project.
+ *        The single project dropdown has been replaced by a multi-select
+ *        chips control. A new link table `diary_event_projects` stores the
+ *        many-to-many relationship (see database/migrations/diary_multi_project.sql).
+ *   2(b) Each diary entry now has EDIT and DELETE actions. The calendar and
+ *        entry drawer expose Edit and Delete buttons; the modal re-opens in
+ *        edit mode and populates all fields including the attached projects.
+ *
+ * This file is self-contained: it acts as both the page renderer and the
+ * JSON API consumed by assets/js/diary.js. All write actions require a CSRF
+ * token and validate input server-side.
+ */
+require_once __DIR__ . '/../config/db.php';
+require_auth();
 
-// ---------------------------------------------------------------------------
-// Handle POST actions: save (create/update) + delete
-// ---------------------------------------------------------------------------
-$editing = null;
-$editProjects = [];
+$page_title = 'Project Planner Diary — PP-SDOMS';
+$active_tab = 'diary';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
+/* ============================================================ */
+/*  JSON API — consumed by diary.js via fetch()                 */
+/* ============================================================ */
+$api_action = $_SERVER['HTTP_X_REQUESTED_WITH'] === 'XMLHttpRequest'
+    || ($_GET['api'] ?? '') === '1'
+    || strpos($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json') !== false;
 
-    $title    = trim($_POST['title'] ?? '');
-    $date     = $_POST['meeting_date'] ?? '';
-    $startT   = $_POST['start_time'] ?: null;
-    $endT     = $_POST['end_time']   ?: null;
-    $location = trim($_POST['location'] ?? '');
-    $attend   = trim($_POST['attendees'] ?? '');
-    $agenda   = trim($_POST['agenda'] ?? '');
-    $minutes  = trim($_POST['minutes'] ?? '');
-    $projIds  = array_filter(array_map('intval', (array)($_POST['project_ids'] ?? [])));
-    $id       = (int)($_POST['id'] ?? 0);
+if ($api_action) {
+    header('Content-Type: application/json; charset=utf-8');
+    $respond = static fn($payload, int $code = 200) => http_response_code($code) and print json_encode($payload, JSON_UNESCAPED_UNICODE) and exit;
 
-    if ($action === 'save') {
-        if ($title === '' || $date === '') {
-            $error = 'Title and date are required.';
-            $editing = compact('id','title','meeting_date','start_time','end_time','location','attendees','agenda','minutes') + ['_p'=>$projIds];
-            $editProjects = $projIds;
-        } else {
-            try {
-                $pdo->beginTransaction();
-                if ($id > 0) {
-                    $stmt = $pdo->prepare("UPDATE meetings SET title=?,meeting_date=?,start_time=?,end_time=?,location=?,attendees=?,agenda=?,minutes=? WHERE id=?");
-                    $stmt->execute([$title,$date,$startT,$endT,$location,$attend,$agenda,$minutes,$id]);
-                } else {
-                    $stmt = $pdo->prepare("INSERT INTO meetings (title,meeting_date,start_time,end_time,location,attendees,agenda,minutes) VALUES (?,?,?,?,?,?,?,?)");
-                    $stmt->execute([$title,$date,$startT,$endT,$location,$attend,$agenda,$minutes]);
-                    $id = (int)$pdo->lastInsertId();
-                }
-                // refresh project attachments (many-to-many)
-                $pdo->prepare("DELETE FROM meeting_projects WHERE meeting_id=?")->execute([$id]);
-                $ins = $pdo->prepare("INSERT INTO meeting_projects (meeting_id,project_id) VALUES (?,?)");
-                foreach ($projIds as $pid) { $ins->execute([$id,$pid]); }
-                $pdo->commit();
-                header('Location: diary.php?ok=1'); exit;
-            } catch (Throwable $ex) {
-                if ($pdo->inTransaction()) $pdo->rollBack();
-                $error = 'Could not save the meeting.';
-                $editing = compact('id','title','meeting_date','start_time','end_time','location','attendees','agenda','minutes') + ['_p'=>$projIds];
-                $editProjects = $projIds;
+    if (!$db_connected || !$pdo) { $respond(['ok' => false, 'error' => 'Database unavailable'], 503); }
+
+    // Ensure the link table exists (idempotent). Safe to run on every request.
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `diary_event_projects` (
+        `diary_event_id` INT NOT NULL,
+        `project_id`     INT NOT NULL,
+        PRIMARY KEY (`diary_event_id`, `project_id`),
+        KEY `idx_dep_project` (`project_id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+    $method = $_SERVER['REQUEST_METHOD'];
+    $body = json_decode(file_get_contents('php://input') ?: '[]', true) ?: [];
+    if (!$body && $method === 'POST') $body = $_POST; // allow form-encoded fallback
+
+    try {
+        if ($method === 'GET') {
+            // List all entries with their linked projects.
+            $rows = $pdo->query("SELECT * FROM diary_events ORDER BY event_date ASC, event_time ASC")->fetchAll();
+            $linkStmt = $pdo->prepare("SELECT p.id, p.programme_title, p.sub_programme
+                                        FROM diary_event_projects dep
+                                        JOIN projects p ON p.id = dep.project_id
+                                        WHERE dep.diary_event_id = ?
+                                        ORDER BY p.programme_title, p.sub_programme");
+            foreach ($rows as &$r) {
+                $linkStmt->execute([$r['id']]);
+                $r['projects'] = $linkStmt->fetchAll();
             }
+            unset($r);
+            $respond(['ok' => true, 'entries' => $rows]);
         }
-    } elseif ($action === 'delete' && $id > 0) {
-        // FK ON CASCADE removes meeting_projects rows automatically
-        $pdo->prepare("DELETE FROM meetings WHERE id=?")->execute([$id]);
-        header('Location: diary.php?ok=2'); exit;
+
+        if ($method === 'POST') {
+            if (!verify_csrf_token($body['csrf_token'] ?? '')) { $respond(['ok' => false, 'error' => 'Invalid session token'], 419); }
+
+            $action = $body['action'] ?? 'save';
+            if ($action === 'delete') {
+                $id = (int)($body['id'] ?? 0);
+                if ($id <= 0) { $respond(['ok' => false, 'error' => 'Missing id'], 422); }
+                $pdo->prepare("DELETE FROM diary_event_projects WHERE diary_event_id = ?")->execute([$id]);
+                $pdo->prepare("DELETE FROM diary_events WHERE id = ?")->execute([$id]);
+                log_audit_trail('DELETE', 'Diary', $id, 'Deleted diary entry #' . $id);
+                $respond(['ok' => true]);
+            }
+
+            // save (create or update)
+            $id    = (int)($body['id'] ?? 0);
+            $title = trim((string)($body['title'] ?? ''));
+            $date  = trim((string)($body['event_date'] ?? ''));
+            if ($title === '' || $date === '') { $respond(['ok' => false, 'error' => 'Title and date are required'], 422); }
+
+            $fields = [
+                'title'        => $title,
+                'description'  => trim((string)($body['description'] ?? '')) ?: null,
+                'event_type'   => trim((string)($body['event_type'] ?? 'Meeting')) ?: 'Meeting',
+                'event_date'   => $date,
+                'event_time'   => trim((string)($body['event_time'] ?? '')) ?: null,
+                'location'     => trim((string)($body['location'] ?? '')) ?: null,
+                'host'         => trim((string)($body['host'] ?? '')) ?: null,
+                'attendees'    => trim((string)($body['attendees'] ?? '')) ?: null,
+                'status'       => trim((string)($body['status'] ?? 'UPCOMING')) ?: 'UPCOMING',
+                'priority'     => trim((string)($body['priority'] ?? 'Medium')) ?: 'Medium',
+            ];
+            // NOTE: project_id column kept for backwards-compat; the real links
+            //       now live in diary_event_projects (multi-project).
+            $projectIds = array_values(array_filter(array_map('intval', (array)($body['project_ids'] ?? [])),
+                                       static fn($v) => $v > 0));
+            $fields['project_id'] = $projectIds[0] ?? null;
+
+            if ($id > 0) {
+                $set = implode(',', array_map(static fn($k) => "`$k`=?", array_keys($fields)));
+                $pdo->prepare("UPDATE diary_events SET $set WHERE id=?")
+                    ->execute([...array_values($fields), $id]);
+            } else {
+                $cols = implode(',', array_map(static fn($k) => "`$k`", array_keys($fields)));
+                $ph   = implode(',', array_fill(0, count($fields), '?'));
+                $pdo->prepare("INSERT INTO diary_events ($cols) VALUES ($ph)")
+                    ->execute(array_values($fields));
+                $id = (int)$pdo->lastInsertId();
+            }
+            // refresh project links
+            $pdo->prepare("DELETE FROM diary_event_projects WHERE diary_event_id = ?")->execute([$id]);
+            $ins = $pdo->prepare("INSERT IGNORE INTO diary_event_projects (diary_event_id, project_id) VALUES (?,?)");
+            foreach ($projectIds as $pid) $ins->execute([$id, $pid]);
+
+            log_audit_trail($id && ($body['id'] ?? 0) ? 'UPDATE' : 'CREATE', 'Diary', $id, 'Saved diary entry "' . $title . '"');
+            $respond(['ok' => true, 'id' => $id]);
+        }
+
+        $respond(['ok' => false, 'error' => 'Method not allowed'], 405);
+    } catch (Throwable $ex) {
+        error_log('diary api: ' . $ex->getMessage());
+        $respond(['ok' => false, 'error' => 'Server error'], 500);
     }
 }
 
-// Load for editing
-if (isset($_GET['edit'])) {
-    $stmt = $pdo->prepare("SELECT * FROM meetings WHERE id=?");
-    $stmt->execute([(int)$_GET['edit']]);
-    $editing = $stmt->fetch() ?: null;
-    if ($editing) {
-        $s = $pdo->prepare("SELECT project_id FROM meeting_projects WHERE meeting_id=?");
-        $s->execute([(int)$editing['id']]);
-        $editProjects = array_column($s->fetchAll(), 'project_id');
-    }
+/* ============================================================ */
+/*  Page render                                                  */
+/* ============================================================ */
+$diary_projects = [];
+if ($db_connected && $pdo) {
+    try {
+        // Ensure link table exists on page render too.
+        $pdo->exec("CREATE TABLE IF NOT EXISTS `diary_event_projects` (
+            `diary_event_id` INT NOT NULL,
+            `project_id`     INT NOT NULL,
+            PRIMARY KEY (`diary_event_id`, `project_id`),
+            KEY `idx_dep_project` (`project_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+        $diary_projects = $pdo->query("SELECT id, programme_title, sub_programme FROM projects ORDER BY programme_title, sub_programme")->fetchAll();
+    } catch (Throwable $e) { $diary_projects = []; }
 }
 
-// List meetings with attached projects (many-to-many)
-$meetings = $pdo->query("
-  SELECT m.*, GROUP_CONCAT(p.code ORDER BY p.code SEPARATOR '||') AS proj_codes,
-            GROUP_CONCAT(p.name ORDER BY p.code SEPARATOR '||')  AS proj_names
-  FROM meetings m
-  LEFT JOIN meeting_projects mp ON mp.meeting_id = m.id
-  LEFT JOIN projects p           ON p.id = mp.project_id
-  GROUP BY m.id
-  ORDER BY m.meeting_date DESC, m.start_time DESC
-")->fetchAll();
-
-$projects = $pdo->query("SELECT id, code, name FROM projects ORDER BY code")->fetchAll();
-
-$ok = $_GET['ok'] ?? '';
-$messages = [1=>'Meeting saved.', 2=>'Meeting deleted.'];
-
-header_html('Diary', 'diary');
+$csrf = get_csrf_token();
+require_once __DIR__ . '/../includes/header.php';
 ?>
-<div class="page-title">
-  <div><h1>Diary</h1><p>Record meetings and attach one or more projects to each entry.</p></div>
-  <button class="btn btn-primary" onclick="openMeetingModal()">+ New meeting</button>
-</div>
-
-<?php if (isset($messages[(int)$ok])): ?>
-  <div class="alert alert-ok"><?= e($messages[(int)$ok]) ?></div>
-<?php endif; ?>
-<?php if (!empty($error)): ?>
-  <div class="alert alert-err"><?= e($error) ?></div>
-<?php endif; ?>
-
-<?php if (!$meetings): ?>
-  <div class="card"><div class="card-body" style="color:var(--muted)">No meetings yet. Click “New meeting” to add one.</div></div>
-<?php endif; ?>
-
-<?php foreach ($meetings as $m):
-  $codes = $m['proj_codes'] ? explode('||', $m['proj_codes']) : [];
-  $names = $m['proj_names'] ? explode('||', $m['proj_names']) : [];
-?>
-<div class="meeting-row">
-  <div class="top">
-    <div>
-      <h3><?= e($m['title']) ?></h3>
-      <div class="meta">
-        <span>📅 <?= e(fmt_date($m['meeting_date'])) ?></span>
-        <?php if ($m['start_time']): ?><span>🕒 <?= e(date('H:i', strtotime($m['start_time']))) ?><?= $m['end_time'] ? ' – ' . e(date('H:i', strtotime($m['end_time']))) : '' ?></span><?php endif; ?>
-        <?php if ($m['location']): ?><span>📍 <?= e($m['location']) ?></span><?php endif; ?>
-      </div>
-      <div style="margin-top:10px">
-        <?php if ($codes): foreach ($codes as $i => $c): ?>
-          <span class="pill"><?= e($c) ?> · <?= e($names[$i] ?? '') ?></span>
-        <?php endforeach; else: ?>
-          <span class="badge badge-neutral">No project attached</span>
-        <?php endif; ?>
-      </div>
-      <?php if ($m['attendees']): ?><div class="body"><strong>Attendees:</strong> <?= e($m['attendees']) ?></div><?php endif; ?>
-      <?php if ($m['agenda']):   ?><div class="body"><strong>Agenda:</strong> <?= e($m['agenda']) ?></div><?php endif; ?>
-      <?php if ($m['minutes']):  ?><div class="body"><strong>Minutes:</strong> <?= e($m['minutes']) ?></div><?php endif; ?>
-    </div>
-    <div class="actions">
-      <a class="btn btn-sm" href="diary.php?edit=<?= (int)$m['id'] ?>">Edit</a>
-      <form method="post" action="diary.php" style="display:inline" onsubmit="return confirm('Delete this meeting?');">
-        <input type="hidden" name="action" value="delete">
-        <input type="hidden" name="id" value="<?= (int)$m['id'] ?>">
-        <button class="btn btn-sm btn-danger" type="submit">Delete</button>
-      </form>
-    </div>
-  </div>
-</div>
-<?php endforeach; ?>
-
-<!-- ============ Meeting modal (create / edit) ============ -->
-<div class="modal-overlay" id="meetModal" role="dialog" aria-modal="true" aria-labelledby="meetTitle">
-  <div class="modal">
-    <div class="modal-head">
-      <h3 id="meetTitle"><?= $editing ? 'Edit meeting' : 'New meeting' ?></h3>
-      <button type="button" class="close-x" onclick="closeMeetingModal()" aria-label="Close">&times;</button>
-    </div>
-    <form method="post" action="diary.php">
-      <input type="hidden" name="action" value="save">
-      <input type="hidden" name="id" value="<?= (int)($editing['id'] ?? 0) ?>">
-      <div class="modal-body">
-        <div class="form-grid">
-          <div class="full"><label>Title *</label><input name="title" value="<?= e($editing['title'] ?? '') ?>" required></div>
-          <div><label>Date *</label><input type="date" name="meeting_date" value="<?= e($editing['meeting_date'] ?? '') ?>" required></div>
-          <div><label>Location</label><input name="location" value="<?= e($editing['location'] ?? '') ?>"></div>
-          <div><label>Start time</label><input type="time" name="start_time" value="<?= e($editing['start_time'] ?? '') ?>"></div>
-          <div><label>End time</label><input type="time" name="end_time" value="<?= e($editing['end_time'] ?? '') ?>"></div>
-          <div class="full"><label>Attendees</label><input name="attendees" value="<?= e($editing['attendees'] ?? '') ?>" placeholder="Comma-separated names"></div>
-          <div class="full"><label>Agenda</label><textarea name="agenda"><?= e($editing['agenda'] ?? '') ?></textarea></div>
-          <div class="full"><label>Minutes / Notes</label><textarea name="minutes"><?= e($editing['minutes'] ?? '') ?></textarea></div>
-          <div class="full">
-            <label>Attached projects <span style="font-weight:400;color:var(--muted)">(select one or more)</span></label>
-            <div class="proj-pick" id="projPick">
-              <?php if (!$projects): ?>
-                <span style="color:var(--muted)">No projects yet. <a href="projects.php">Add one</a> first.</span>
-              <?php endif; ?>
-              <?php foreach ($projects as $p):
-                $checked = in_array((int)$p['id'], $editProjects, true);
-              ?>
-                <label data-pid="<?= (int)$p['id'] ?>" <?= $checked ? 'class="checked"' : '' ?>>
-                  <input type="checkbox" name="project_ids[]" value="<?= (int)$p['id'] ?>" <?= $checked ? 'checked' : '' ?> onchange="syncChip(this)">
-                  <?= e($p['code']) ?> <small>· <?= e($p['name']) ?></small>
-                </label>
-              <?php endforeach; ?>
-            </div>
-            <div class="hint">A meeting can be linked to multiple projects.</div>
-          </div>
+<link rel="stylesheet" href="/assets/diary.css?v=20261019-1">
+<div class="app-container diary-module">
+    <div class="section-header diary-section-header">
+        <div class="section-title-wrap">
+            <span class="section-title-icon" aria-hidden="true">♧</span>
+            <div><h2 class="section-title">Project Planner Diary</h2><div class="diary-page-subtitle">Plan meetings, tasks, deadlines and project activities.</div></div>
         </div>
-      </div>
-      <div class="modal-foot">
-        <a class="btn" href="diary.php">Cancel</a>
-        <button type="submit" class="btn btn-primary"><?= $editing ? 'Save changes' : 'Create meeting' ?></button>
-      </div>
-    </form>
-  </div>
+        <button type="button" id="addDiaryEntryBtn" class="btn-primary-green">＋ <span>New Diary Entry</span></button>
+    </div>
+
+    <section class="calendar-card" aria-label="Diary calendar">
+        <div class="calendar-header diary-calendar-header">
+            <div class="diary-month-navigation">
+                <button type="button" id="prevMonthBtn" class="status-pill">← Prev</button>
+                <h3 id="calendarMonthDisplay" aria-live="polite"></h3>
+                <button type="button" id="nextMonthBtn" class="status-pill">Next →</button>
+            </div>
+        </div>
+        <div id="calendarGrid" class="calendar-grid"></div>
+    </section>
+
+    <nav class="diary-category-filters" aria-label="Filter diary entries by category">
+        <button type="button" class="calendar-event-pill event-cat-meeting" data-filter-category="Meeting" aria-pressed="false">Meeting</button>
+        <button type="button" class="calendar-event-pill event-cat-task" data-filter-category="Task" aria-pressed="false">Task</button>
+        <button type="button" class="calendar-event-pill event-cat-deadline" data-filter-category="Deadline" aria-pressed="false">Deadline</button>
+        <button type="button" class="calendar-event-pill event-cat-event" data-filter-category="Event" aria-pressed="false">Event</button>
+        <button type="button" class="calendar-event-pill event-cat-general" data-filter-category="General" aria-pressed="false">General</button>
+    </nav>
+
+    <section id="linkedProjectDrawer" class="linked-project-drawer diary-details-panel" aria-live="polite">
+        <div class="diary-details-heading">
+            <h3><span aria-hidden="true">▣</span> Event Details &amp; Linked Project Specifications</h3>
+            <button type="button" id="clearDiarySelection" class="modal-close-btn" aria-label="Clear selection">×</button>
+        </div>
+        <div id="drawerProjectContent" class="diary-details-content"><p class="diary-empty-note">Select a category on the calendar to view its entries.</p></div>
+    </section>
 </div>
 
-<script>
-function openMeetingModal(){ document.getElementById('meetModal').classList.add('is-open'); }
-function closeMeetingModal(){ document.getElementById('meetModal').classList.remove('is-open'); }
-function syncChip(cb){
-  var lbl = cb.closest('label');
-  lbl.classList.toggle('checked', cb.checked);
-}
-(function(){
-  var m=document.getElementById('meetModal');
-  m.addEventListener('click',function(e){ if(e.target===m) closeMeetingModal(); });
-  document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeMeetingModal(); });
-  <?php if ($editing): ?> openMeetingModal(); <?php endif; ?>
-})();
-</script>
-<?php footer_html(); ?>
+<!-- Diary entry modal (create + edit) -->
+<div id="newDiaryModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="diaryModalTitle">
+    <div class="modal-dialog diary-modal-dialog">
+        <div class="modal-header diary-modal-header">
+            <div>
+                <span class="diary-modal-kicker">PROJECT PLANNER DIARY</span>
+                <h3 class="modal-title" id="diaryModalTitle">Schedule New Diary Entry</h3>
+                <p id="diaryModalSubtitle">Capture the activity, schedule and project details.</p>
+            </div>
+            <button type="button" class="modal-close-btn" onclick="closeNewDiaryModal()" aria-label="Close">×</button>
+        </div>
+        <form id="newDiaryForm" class="diary-entry-form">
+            <input type="hidden" id="diaryEntryId" value="">
+            <input type="hidden" id="diaryCsrf" value="<?= htmlspecialchars($csrf) ?>">
+            <div class="form-group"><label for="diaryTitle">Entry Title <span>*</span></label><input type="text" id="diaryTitle" class="form-input" maxlength="255" required placeholder="e.g. KNH project review meeting"></div>
+            <div class="diary-form-grid">
+                <div class="form-group"><label for="diaryDate">Event Date <span>*</span></label><input type="date" id="diaryDate" class="form-input" required></div>
+                <div class="form-group"><label for="diaryTime">Event Time</label><input type="time" id="diaryTime" class="form-input" value="09:00"></div>
+                <div class="form-group"><label for="diaryCategory">Category <span>*</span></label><select id="diaryCategory" class="form-select" required><option value="Meeting">Meeting</option><option value="Task">Task</option><option value="Deadline">Deadline</option><option value="Event">Event</option><option value="Field Visit">Field Visit</option><option value="General">General</option></select></div>
+                <div class="form-group"><label for="diaryPriority">Priority</label><select id="diaryPriority" class="form-select"><option value="Medium">Medium</option><option value="High">High</option><option value="Critical">Critical</option><option value="Low">Low</option></select></div>
+            </div>
+
+            <!-- CHANGE 2(a): multi-project attachment (chips) -->
+            <div class="form-group">
+                <label for="diaryProjectIds">Link to Projects / Programmes <small>(select one or more)</small></label>
+                <div class="diary-proj-pick" id="diaryProjectIds">
+                    <?php if (!$diary_projects): ?>
+                        <span class="diary-empty-note">No projects available.</span>
+                    <?php endif; ?>
+                    <?php foreach ($diary_projects as $project): ?>
+                        <label class="diary-proj-chip" data-pid="<?= (int)$project['id'] ?>">
+                            <input type="checkbox" value="<?= (int)$project['id'] ?>">
+                            <span><?= htmlspecialchars(trim(($project['programme_title'] ?? '') . ' — ' . ($project['sub_programme'] ?? ''), ' —')) ?></span>
+                        </label>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
+            <div class="diary-form-grid">
+                <div class="form-group"><label for="diaryLocation">Location</label><input type="text" id="diaryLocation" class="form-input" maxlength="255" placeholder="Venue or meeting link"></div>
+                <div class="form-group"><label for="diaryHost">Host / Contact</label><input type="text" id="diaryHost" class="form-input" maxlength="150" placeholder="Responsible person"></div>
+            </div>
+            <div class="form-group"><label for="diaryAttendees">Attendees</label><input type="text" id="diaryAttendees" class="form-input" placeholder="Names or teams attending"></div>
+            <div class="form-group"><label for="diaryContent">Agenda &amp; Operational Notes</label><textarea id="diaryContent" class="form-textarea" rows="4" placeholder="Agenda, expected deliverables or other useful details…"></textarea></div>
+            <div id="diaryFormError" class="diary-form-error" hidden></div>
+            <div class="diary-form-actions">
+                <button type="button" class="status-pill" id="diaryDeleteBtn" style="margin-right:auto;display:none;background:#dc2626;color:#fff;border-color:#dc2626;">Delete</button>
+                <button type="button" class="status-pill" onclick="closeNewDiaryModal()">Cancel</button>
+                <button type="submit" class="btn-primary-green" id="diarySaveBtn">Save Diary Entry</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script src="/assets/js/diary.js?v=20261019-1"></script>
+<?php require_once __DIR__ . '/../includes/footer.php'; ?>
