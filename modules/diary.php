@@ -25,7 +25,7 @@ $active_tab = 'diary';
 /* ============================================================ */
 /*  JSON API — consumed by diary.js via fetch()                 */
 /* ============================================================ */
-$api_action = $_SERVER['HTTP_X_REQUESTED_WITH'] === 'XMLHttpRequest'
+$api_action = ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '') === 'XMLHttpRequest'
     || ($_GET['api'] ?? '') === '1'
     || strpos($_SERVER['HTTP_ACCEPT'] ?? '', 'application/json') !== false;
 
