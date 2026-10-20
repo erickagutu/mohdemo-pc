@@ -1,21 +1,21 @@
 <?php
 /**
- * Minimal site header. The original PP-SDOMS deployment ships its own
- * includes/header.php with full navigation, auth and styling; this file is a
- * lightweight stand-in so the modules render when deployed standalone.
+ * PP-SDOMS site header — matches the production assets/style.css layout.
  *
- * If you already have includes/header.php on your server, keep yours — the
- * modules only require the helpers defined in config/db.php and the
- * $page_title / $active_tab variables set before this file is included.
+ * Set $page_title and $active_tab before including this file.
+ * If you already have your own includes/header.php on the server, keep yours.
  */
 require_once __DIR__ . '/../config/db.php';
 @session_start();
+
 $nav = [
-    'pc'    => ['Performance Contract', '/modules/pc.php'],
-    'diary' => ['Diary',                '/modules/diary.php'],
+    'dashboard' => ['Dashboard',          '/index.php'],
+    'pc'        => ['Performance Contract', '/modules/pc.php'],
+    'diary'     => ['Project Diary',       '/modules/diary.php'],
 ];
 $active_tab = $active_tab ?? '';
 $page_title = $page_title ?? 'PP-SDOMS';
+$user = get_current_user_data();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -23,17 +23,41 @@ $page_title = $page_title ?? 'PP-SDOMS';
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title><?= htmlspecialchars($page_title) ?></title>
-<link rel="stylesheet" href="/assets/styles.css">
+<link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-<header class="app-header">
-  <div class="app-bar">
-    <a href="/" class="brand"><span class="brand-mark">PP</span><span class="brand-name">PP-SDOMS</span></a>
-    <nav class="app-nav">
-      <?php foreach ($nav as $key => [$label, $href]): ?>
-        <a href="<?= $href ?>" class="<?= $active_tab === $key ? 'is-active' : '' ?>"><?= htmlspecialchars($label) ?></a>
-      <?php endforeach; ?>
-    </nav>
+
+<!-- Top Ministerial Header -->
+<header class="top-header">
+  <a href="/" class="brand-container">
+    <div class="brand-text">
+      <h1>State Department for Medical Services</h1>
+      <div class="sub-title">Performance Planning &amp; Strategic Delivery Online Management System (PP-SDOMS)</div>
+    </div>
+  </a>
+  <div class="header-user-actions">
+    <div class="user-capsule">
+      <div class="user-info">
+        <span class="user-name"><?= htmlspecialchars($user['full_name'] ?? 'User') ?></span>
+        <span class="user-role-badge"><?= htmlspecialchars($user['role'] ?? 'Staff') ?></span>
+      </div>
+    </div>
+    <a href="/logout.php" class="btn-logout">⏻ Logout</a>
   </div>
 </header>
-<main class="app-main">
+
+<!-- Main Navbar -->
+<nav class="main-nav">
+  <ul class="nav-links">
+    <?php foreach ($nav as $key => [$label, $href]): ?>
+      <li class="nav-item">
+        <a href="<?= $href ?>" class="nav-link<?= $active_tab === $key ? ' active' : '' ?>"><?= htmlspecialchars($label) ?></a>
+      </li>
+    <?php endforeach; ?>
+  </ul>
+</nav>
+
+<!-- Core Values Banner -->
+<div class="core-values-banner">"Quality Healthcare for All Kenyans — Innovation · Integrity · Service Excellence"</div>
+
+<main class="app-container">

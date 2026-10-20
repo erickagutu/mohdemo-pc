@@ -1,7 +1,6 @@
 /* Project Planner Diary — calendar, CRUD, multi-project support.
- *
- * Talks to modules/diary.php?api=1 which returns JSON.
- * Supports: list, create, edit, delete, and multiple projects per entry.
+ * Uses the production assets/style.css calendar classes.
+ * Talks to modules/diary.php?api=1 (JSON).
  */
 (function () {
     'use strict';
@@ -14,14 +13,16 @@
     var currentDate = new Date();
     var editingId = null;
 
-    var CATEGORY_COLORS = {
-        'Meeting': '#2563eb',
-        'Task': '#7c3aed',
-        'Deadline': '#dc2626',
-        'Event': '#059669',
-        'Field Visit': '#ea580c',
-        'General': '#64748b'
-    };
+    /* The production stylesheet uses event-cat-* for category colours. */
+    function categoryClass(type) {
+        switch ((type || '').toLowerCase()) {
+            case 'meeting':  return 'event-cat-meeting';
+            case 'task':     return 'event-cat-task';
+            case 'deadline': return 'event-cat-deadline';
+            case 'event':    return 'event-cat-event';
+            default:         return 'event-cat-general';
+        }
+    }
 
     /* -------------------- API helpers -------------------- */
     function api(method, body) {
@@ -37,10 +38,21 @@
         });
     }
 
-    /* -------------------- Calendar -------------------- */
+    /* -------------------- Utilities -------------------- */
     function fmtYMD(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
     function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+    function categoryLabel(type) {
+        switch ((type || '').toLowerCase()) {
+            case 'meeting': return 'Meeting';
+            case 'task': return 'Task';
+            case 'deadline': return 'Deadline';
+            case 'event': return 'Event';
+            case 'field visit': return 'Field Visit';
+            default: return 'General';
+        }
+    }
 
+    /* -------------------- Calendar -------------------- */
     function renderCalendar() {
         var grid = document.getElementById('calendarGrid');
         var display = document.getElementById('calendarMonthDisplay');
@@ -51,8 +63,8 @@
         var first = new Date(y, m, 1);
         var startDow = first.getDay();
         var daysInMonth = new Date(y, m + 1, 0).getDate();
+        var prevMonthDays = new Date(y, m, 0).getDate();
 
-        // Build entries-by-date map
         var byDate = {};
         allEntries.forEach(function (e) {
             var key = (e.event_date || '').slice(0, 10);
@@ -61,24 +73,49 @@
         });
 
         var html = '';
-        ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(function (d) { html += '<div class="cal-dow">' + d + '</div>'; });
-        for (var i = 0; i < startDow; i++) html += '<div class="cal-day empty"></div>';
+        ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].forEach(function (d) {
+            html += '<div class="calendar-day-header">' + d + '</div>';
+        });
+
+        // Leading days from previous month
+        for (var i = startDow - 1; i >= 0; i--) {
+            html += '<div class="calendar-day-cell other-month"><span class="day-number">' + (prevMonthDays - i) + '</span></div>';
+        }
+
         for (var day = 1; day <= daysInMonth; day++) {
             var ds = y + '-' + String(m + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
             var dayEntries = byDate[ds] || [];
             if (activeCategory) dayEntries = dayEntries.filter(function (e) { return e.event_type === activeCategory; });
+            var hasEvent = dayEntries.length > 0;
+            var isToday = ds === fmtYMD(new Date());
+
             var pills = '';
             dayEntries.slice(0, 4).forEach(function (e) {
-                var c = CATEGORY_COLORS[e.event_type] || '#64748b';
-                pills += '<button type="button" class="cal-pill" style="border-color:' + c + ';color:' + c + '" data-eid="' + e.id + '" title="' + escapeHtml(e.title) + '">' + escapeHtml(e.title) + '</button>';
+                pills += '<button type="button" class="calendar-event-pill ' + categoryClass(e.event_type) + '" data-eid="' + e.id + '" title="' + escapeHtml(e.title) + '">' + escapeHtml(e.title) + '</button>';
             });
-            if (dayEntries.length > 4) pills += '<span class="cal-more">+' + (dayEntries.length - 4) + ' more</span>';
-            html += '<div class="cal-day' + (ds === fmtYMD(new Date()) ? ' today' : '') + '"><span class="cal-date">' + day + '</span><div class="cal-pills">' + pills + '</div></div>';
+            if (dayEntries.length > 4) {
+                pills += '<span class="calendar-event-pill ' + categoryClass(dayEntries[0].event_type) + '" style="opacity:.7;cursor:default;">+' + (dayEntries.length - 4) + ' more</span>';
+            }
+
+            html += '<div class="calendar-day-cell' + (hasEvent ? ' has-event' : '') + (isToday ? ' selected' : '') + '" data-date="' + ds + '">' +
+                        '<span class="day-number">' + day + '</span>' +
+                        '<div class="events-container">' + pills + '</div>' +
+                    '</div>';
         }
+
+        // Trailing days from next month
+        var totalCells = startDow + daysInMonth;
+        var trailing = (7 - (totalCells % 7)) % 7;
+        for (var t = 1; t <= trailing; t++) {
+            html += '<div class="calendar-day-cell other-month"><span class="day-number">' + t + '</span></div>';
+        }
+
         grid.innerHTML = html;
 
-        grid.querySelectorAll('.cal-pill').forEach(function (btn) {
-            btn.addEventListener('click', function () {
+        // Wire event pills
+        grid.querySelectorAll('.calendar-event-pill[data-eid]').forEach(function (btn) {
+            btn.addEventListener('click', function (ev) {
+                ev.stopPropagation();
                 var eid = parseInt(btn.getAttribute('data-eid'), 10);
                 var entry = allEntries.find(function (e) { return parseInt(e.id, 10) === eid; });
                 if (entry) showInDrawer(entry);
@@ -90,16 +127,19 @@
     function showInDrawer(entry) {
         var content = document.getElementById('drawerProjectContent');
         var projects = entry.projects || [];
+
         var projHtml = '';
         if (projects.length) {
-            projHtml = '<div class="diary-linked-projects"><h4>Linked Projects (' + projects.length + ')</h4><ul>';
+            projHtml = '<div class="diary-linked-projects-list">';
             projects.forEach(function (p) {
-                projHtml += '<li><span class="proj-pill">' + escapeHtml((p.programme_title || '') + ' — ' + (p.sub_programme || '')) + '</span></li>';
+                var label = trimDash((p.programme_title || '') + ' — ' + (p.sub_programme || ''));
+                projHtml += '<span class="proj-pill">' + escapeHtml(label) + '</span>';
             });
-            projHtml += '</ul></div>';
+            projHtml += '</div>';
         } else {
-            projHtml = '<p class="diary-empty-note">No projects linked to this entry.</p>';
+            projHtml = '<p class="diary-unlinked-note">No projects linked to this entry.</p>';
         }
+
         var meta = '';
         if (entry.event_time) meta += '<span>🕒 ' + escapeHtml(entry.event_time) + '</span>';
         if (entry.location) meta += '<span>📍 ' + escapeHtml(entry.location) + '</span>';
@@ -109,25 +149,28 @@
 
         content.innerHTML =
             '<div class="diary-entry-detail">' +
-                '<div class="diary-entry-detail-head">' +
-                    '<div><h4>' + escapeHtml(entry.title) + '</h4>' +
-                    '<div class="diary-entry-meta"><span class="entry-cat-badge" style="background:' + (CATEGORY_COLORS[entry.event_type] || '#64748b') + '">' + escapeHtml(entry.event_type) + '</span> <span>📅 ' + escapeHtml(entry.event_date) + '</span>' + meta + '</div></div>' +
-                    '<div class="diary-entry-actions">' +
-                        '<button type="button" class="btn-edit" data-act="edit">✎ Edit</button> ' +
-                        '<button type="button" class="btn-delete" data-act="delete">🗑 Delete</button>' +
-                    '</div>' +
+                '<div class="diary-entry-topline">' +
+                    '<span class="calendar-event-pill ' + categoryClass(entry.event_type) + '">' + escapeHtml(categoryLabel(entry.event_type)) + '</span>' +
+                    '<span>📅 ' + escapeHtml(entry.event_date) + '</span>' + meta +
                 '</div>' +
-                (entry.attendees ? '<p><strong>Attendees:</strong> ' + escapeHtml(entry.attendees) + '</p>' : '') +
+                '<h4>' + escapeHtml(entry.title) + '</h4>' +
                 (entry.description ? '<p>' + escapeHtml(entry.description).replace(/\n/g, '<br>') + '</p>' : '') +
+                (entry.attendees ? '<div class="diary-entry-meta"><span><strong>Attendees:</strong> ' + escapeHtml(entry.attendees) + '</span></div>' : '') +
+                '<div class="diary-entry-actions" style="margin-top:10px;">' +
+                    '<button type="button" class="btn-edit" data-act="edit">✎ Edit</button>' +
+                    '<button type="button" class="btn-delete" data-act="delete">🗑 Delete</button>' +
+                '</div>' +
                 projHtml +
             '</div>';
 
         content.querySelector('[data-act="edit"]').addEventListener('click', function () { openModal(entry); });
         content.querySelector('[data-act="delete"]').addEventListener('click', function () { deleteEntry(entry); });
-        document.getElementById('linkedProjectDrawer').classList.add('is-open');
+        document.getElementById('linkedProjectDrawer').classList.add('active');
     }
 
-    /* -------------------- Modal (create + edit) -------------------- */
+    function trimDash(s) { return s.replace(/^[\s—]+|[\s—]+$/g, ''); }
+
+    /* -------------------- Modal -------------------- */
     function openModal(entry) {
         editingId = entry ? parseInt(entry.id, 10) : null;
         document.getElementById('diaryEntryId').value = editingId || '';
@@ -141,7 +184,6 @@
         document.getElementById('diaryAttendees').value = entry ? (entry.attendees || '') : '';
         document.getElementById('diaryContent').value = entry ? (entry.description || '') : '';
 
-        // multi-project chips
         var linked = {};
         if (entry && entry.projects) entry.projects.forEach(function (p) { linked[parseInt(p.id, 10)] = true; });
         document.querySelectorAll('#diaryProjectIds .diary-proj-chip').forEach(function (lbl) {
@@ -158,7 +200,7 @@
         if (entry) {
             titleEl.textContent = 'Edit Diary Entry';
             subEl.textContent = 'Update the activity, schedule and project details.';
-            delBtn.style.display = 'inline-block';
+            delBtn.style.display = 'inline-flex';
         } else {
             titleEl.textContent = 'Schedule New Diary Entry';
             subEl.textContent = 'Capture the activity, schedule and project details.';
@@ -166,11 +208,15 @@
         }
 
         var err = document.getElementById('diaryFormError'); err.hidden = true; err.textContent = '';
-        document.getElementById('newDiaryModal').classList.add('is-open');
+        var modal = document.getElementById('newDiaryModal');
+        modal.classList.add('active');
         document.getElementById('diaryTitle').focus();
     }
 
-    function closeModal() { document.getElementById('newDiaryModal').classList.remove('is-open'); editingId = null; }
+    function closeModal() {
+        document.getElementById('newDiaryModal').classList.remove('active');
+        editingId = null;
+    }
 
     function collectForm() {
         var pids = [];
@@ -209,7 +255,7 @@
         if (!confirm('Delete "' + entry.title + '"? This cannot be undone.')) return;
         api('POST', { action: 'delete', id: parseInt(entry.id, 10) }).then(function (res) {
             if (res.ok && res.data.ok) {
-                document.getElementById('linkedProjectDrawer').classList.remove('is-open');
+                document.getElementById('linkedProjectDrawer').classList.remove('active');
                 loadEntries();
             } else { alert((res.data && res.data.error) || 'Could not delete.'); }
         });
@@ -219,11 +265,17 @@
     document.addEventListener('DOMContentLoaded', function () {
         document.getElementById('addDiaryEntryBtn').addEventListener('click', function () { openModal(null); });
         document.getElementById('newDiaryForm').addEventListener('submit', saveEntry);
+        document.getElementById('diaryCancelBtn').addEventListener('click', closeModal);
+        document.getElementById('diaryModalClose').addEventListener('click', closeModal);
+        document.getElementById('newDiaryModal').addEventListener('click', function (e) { if (e.target === this) closeModal(); });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+
         document.getElementById('diaryDeleteBtn').addEventListener('click', function () {
             if (!editingId) return;
             var entry = allEntries.find(function (e) { return parseInt(e.id, 10) === editingId; });
             if (entry) deleteEntry(entry);
         });
+
         // chip toggle
         document.querySelectorAll('#diaryProjectIds .diary-proj-chip').forEach(function (lbl) {
             var cb = lbl.querySelector('input[type=checkbox]');
@@ -232,24 +284,28 @@
 
         document.getElementById('prevMonthBtn').addEventListener('click', function () { currentDate.setMonth(currentDate.getMonth() - 1); renderCalendar(); });
         document.getElementById('nextMonthBtn').addEventListener('click', function () { currentDate.setMonth(currentDate.getMonth() + 1); renderCalendar(); });
-        document.getElementById('clearDiarySelection').addEventListener('click', function () { document.getElementById('linkedProjectDrawer').classList.remove('is-open'); });
+        document.getElementById('clearDiarySelection').addEventListener('click', function () {
+            document.getElementById('linkedProjectDrawer').classList.remove('active');
+        });
 
-        document.querySelectorAll('.calendar-event-pill').forEach(function (btn) {
+        document.querySelectorAll('.diary-category-filters .calendar-event-pill').forEach(function (btn) {
             btn.addEventListener('click', function () {
                 var cat = btn.getAttribute('data-filter-category');
-                if (activeCategory === cat) { activeCategory = null; btn.setAttribute('aria-pressed', 'false'); }
-                else {
+                if (activeCategory === cat) {
+                    activeCategory = null;
+                    btn.classList.remove('active');
+                    btn.setAttribute('aria-pressed', 'false');
+                } else {
                     activeCategory = cat;
-                    document.querySelectorAll('.calendar-event-pill').forEach(function (b) { b.setAttribute('aria-pressed', 'false'); });
+                    document.querySelectorAll('.diary-category-filters .calendar-event-pill').forEach(function (b) {
+                        b.classList.remove('active'); b.setAttribute('aria-pressed', 'false');
+                    });
+                    btn.classList.add('active');
                     btn.setAttribute('aria-pressed', 'true');
                 }
                 renderCalendar();
             });
         });
-
-        window.closeNewDiaryModal = closeModal;
-        document.getElementById('newDiaryModal').addEventListener('click', function (e) { if (e.target === this) closeModal(); });
-        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
 
         loadEntries();
     });
